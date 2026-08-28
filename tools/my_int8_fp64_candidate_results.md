@@ -61,6 +61,19 @@ Command:
 
 Raw log: `tools/candidate_4096_186131.out`.
 
+## Tensor Core Verification
+
+Nsight Compute enumerated the candidate GEMM kernel as:
+
+```text
+cutlass_80_tensorop_i16832gemm_s8_128x64_128x3_tn_align16
+```
+
+The `sm_80`, `tensorop`, `i16832`, `s8`, `tn`, and `align16` specialization
+confirms that the transposed A layout selects the Ampere INT8 Tensor Core TN
+path. The original regular NN call was separately observed to select a
+`cutlass1x` non-Tensor-Core kernel.
+
 ## Interpretation
 
 The transposed layout and anti-diagonal accumulation preserve baseline-level

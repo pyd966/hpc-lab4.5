@@ -1,0 +1,22 @@
+==PROF== Connected to process 91 (/home/h3250106394/lab4.5/tools/benchmark_candidate)
+size_M,size_N,size_K,method,splits,time_ms,gflops,max_abs_err,l2_rel_err
+1024,1024,1024,fp64_cublas,0,1.0732,2001.10,0,0
+1024,1024,1024,int8_cublas_baseline,2,3.6024,596.12,1.227e-03,2.193e-05
+1024,1024,1024,my_int8_fp64,2,1.1479,1870.79,1.227e-03,2.193e-05
+1024,1024,1024,cublas_emulated,2,2.4105,890.89,2.746e-05,5.396e-07
+==PROF== Disconnected from process 91
+==WARNING== No kernels were profiled.
+Available Kernels:
+1. <unnamed>::recombine_diagonal(const int *, double *, double, unsigned long)
+2. acc_diff_kernel(const double *, const double *, int, double *, double *, double *)
+3. cublasLt_fused_imma_dgemm_kernel_sm80
+4. maxabs_block_kernel(const double *, unsigned long, double *)
+5. quantize_one_split_kernel(double *, signed char *, double, unsigned long)
+6. recombine_add_kernel(const int *, double *, double, unsigned long)
+7. void <unnamed>::quantize_a_transposed<(int)2>(const double *, signed char *, int, int, unsigned long, double)
+8. void <unnamed>::quantize_b_regular<(int)2>(const double *, signed char *, unsigned long, unsigned long, double)
+9. void cublasLt_imma_emu::max_scale_pack_ker<(int)64, (int)4, (int)128, const_emu_stride_array<double>, (emu_internal_pack_t)0>(unsigned int, unsigned int, unsigned long, unsigned long, unsigned long, unsigned long, unsigned int, unsigned int, T4, unsigned int, unsigned int, unsigned int, int, int *, void *, int *, int, int)
+10. void cutlass1x::gemm::gemm_kernel_nolb<cutlass1x::gemm::Gemm<cutlass1x::gemm::IgemmTraits<(cutlass1x::MatrixLayout::Kind)1, (cutlass1x::MatrixLayout::Kind)1, cutlass1x::Shape<(int)32, (int)64, (int)64, (int)1>, int, cutlass1x::gemm::LinearScalingDevicePtr<int, cutlass1x::gemm::FragmentMultiplyAdd<int, int, (bool)1>>, cutlass1x::Shape<(int)32, (int)8, (int)8, (int)1>, int, cutlass1x::gemm::IgemmTraitsHelper<(cutlass1x::MatrixLayout::Kind)1, (cutlass1x::MatrixLayout::Kind)1, cutlass1x::Shape<(int)32, (int)64, (int)64, (int)1>, int, cutlass1x::gemm::LinearScalingDevicePtr<int, cutlass1x::gemm::FragmentMultiplyAdd<int, int, (bool)1>>, cutlass1x::Shape<(int)32, (int)8, (int)8, (int)1>, int>>>>(T1::Params)
+11. void cutlass::Kernel2<cublasLt_imma_emu::cutlass_80_tensorop_d884gemm_128x128_16x3_nn_align1>(T1::Params, const int *, int)
+12. void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_128x128_16x3_nn_align1>(T1::Params)
+13. void cutlass::Kernel2<cutlass_80_tensorop_i16832gemm_s8_128x64_128x3_tn_align16>(T1::Params)
