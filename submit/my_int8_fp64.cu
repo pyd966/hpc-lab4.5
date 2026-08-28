@@ -411,8 +411,8 @@ extern "C" int gemm_my_int8_fp64(
     result = begin_workspace_use(stream);
     if (result != 0) return result;
 
-    // The published grader is Hopper; the currently exposed lab partition is
-    // Ampere. Keep each architecture on its measured best implementation.
+    // lab3 is Hopper; retain the independently measured Ampere fallback for
+    // compatibility with lab4g10 and other CC 8.x devices.
     if (workspace.compute_major >= 9) {
         result = run_vendor(M, N, K, dA, dB, dC, splits, handle, stream);
         return finish_workspace_use(stream, result);

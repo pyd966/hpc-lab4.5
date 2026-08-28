@@ -39,7 +39,11 @@ constexpr int kScaleCount = kDiagonalScale + 2 * kMaxSplits - 1;
 #define LAB45_USE_WMMA 1
 #endif
 
-constexpr cublasGemmAlgo_t kGemmAlgo = CUBLAS_GEMM_DEFAULT;
+#ifndef LAB45_GEMM_ALGO
+#define LAB45_GEMM_ALGO CUBLAS_GEMM_DEFAULT
+#endif
+
+constexpr cublasGemmAlgo_t kGemmAlgo = LAB45_GEMM_ALGO;
 
 struct Workspace {
     int device = -1;
