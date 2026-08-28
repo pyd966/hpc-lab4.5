@@ -1,0 +1,10 @@
+benchmark
+*.o
+*.orig
+*.rej
+*.nsys-rep
+*.ncu-rep
+*.qdstrm
+*.sqlite
+tools/int8_gemm_probe
+tools/pair_pruning_probe
