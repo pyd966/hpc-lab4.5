@@ -1,0 +1,48 @@
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=2 D=2 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,2,2,3,4,16.847003,8158.07,3.101298087e-03,2.683855789e-05
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=2 D=3 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,2,3,4,4,20.794900,6609.26,2.572932715e-03,2.191820695e-05
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=4 D=4 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,4,4,10,16,47.170377,2913.67,6.194418489e-08,5.369745565e-10
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=4 D=5 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,4,5,13,16,59.626436,2305.00,4.339871751e-08,3.396649637e-10
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=6 D=6 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,6,6,21,36,93.592470,1468.48,1.179500941e-12,1.007642775e-14
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=6 D=7 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,6,7,26,36,112.166812,1225.31,8.029132914e-13,5.681553397e-15
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=8 D=8 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,8,8,36,64,149.508123,919.27,6.252776075e-13,2.138752377e-15
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=4096 splits=8 D=9 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+4096,8,9,43,64,176.863916,777.09,6.252776075e-13,2.138752377e-15
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=2 D=2 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,2,2,3,4,117.122097,9387.74,4.832115950e-03,2.684942864e-05
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=2 D=3 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,2,3,4,4,149.995672,7330.29,3.567862336e-03,2.192054115e-05
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=4 D=4 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,4,4,10,16,351.652166,3126.70,9.850541360e-08,5.373596566e-10
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=4 D=5 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,4,5,13,16,428.412941,2566.48,5.933517855e-08,3.398068731e-10
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=6 D=6 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,6,6,21,36,829.824212,1324.99,1.918465387e-12,1.030676090e-14
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=6 D=7 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,6,7,26,36,1090.382097,1008.37,1.648459147e-12,6.071510152e-15
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=8 D=8 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,8,8,36,64,1606.308788,684.50,1.534772309e-12,3.018010401e-15
+GPU=NVIDIA A100 80GB PCIe MIG 1g.10gb CC=8.0 size=8192 splits=8 D=9 iters=3
+size,splits,D,retained_pairs,total_pairs,time_ms,gflops,max_abs_err,l2_rel_err
+8192,8,9,43,64,2084.393385,527.50,1.534772309e-12,3.018010401e-15

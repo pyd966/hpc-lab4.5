@@ -1,5 +1,13 @@
 #include "gemm_api.h"
 #include "utils.h"
+#include "groupwise_wmma_kernel.cuh"
+#include "groupwise_wmma_direct.cuh"
+#include "groupwise_mma_direct.cuh"
+#include "groupwise_mma_shared.cuh"
+#include "groupwise_mma_shared_n16.cuh"
+#include "groupwise_mma_large.cuh"
+#include "groupwise_mma_large_db.cuh"
+#include "groupwise_mma_ldmatrix.cuh"
 
 #include <cmath>
 #include <cstddef>
@@ -10,9 +18,6 @@ namespace {
 constexpr int kMaxSplits = 8;
 constexpr int kTile = 32;
 constexpr int kBlockRows = 8;
-constexpr size_t kVendorWorkspaceBytes =
-    size_t{2} * 1024 * 1024 * 1024;
-
 constexpr int kScaleA = 0;
 constexpr int kInvScaleA = kScaleA + kMaxSplits;
 constexpr int kScaleB = kInvScaleA + kMaxSplits;
@@ -20,63 +25,35 @@ constexpr int kInvScaleB = kScaleB + kMaxSplits;
 constexpr int kDiagonalScale = kInvScaleB + kMaxSplits;
 constexpr int kScaleCount = kDiagonalScale + 2 * kMaxSplits - 1;
 
+/*
+ * 0: all 2*S-1 diagonals
+ * 1: conservative S+1 diagonals (the default during correctness bring-up)
+ * 2: S diagonals
+ * 3: min(S, 6) diagonals
+ */
+#ifndef LAB45_DIAGONAL_MODE
+#define LAB45_DIAGONAL_MODE 1
+#endif
+
+#ifndef LAB45_USE_WMMA
+#define LAB45_USE_WMMA 1
+#endif
+
+constexpr cublasGemmAlgo_t kGemmAlgo = CUBLAS_GEMM_DEFAULT;
+
 struct Workspace {
     int device = -1;
-    int compute_major = -1;
     int8_t* aq = nullptr;
     int8_t* bq = nullptr;
     int32_t* diagonal = nullptr;
     unsigned long long* max_bits = nullptr;
     double* scales = nullptr;
-    void* vendor = nullptr;
-    cudaEvent_t ready = nullptr;
-    cudaStream_t last_stream = nullptr;
-    bool event_recorded = false;
     size_t aq_capacity = 0;
     size_t bq_capacity = 0;
     size_t diagonal_capacity = 0;
-    size_t vendor_capacity = 0;
 };
 
 thread_local Workspace workspace;
-
-int initialize_device() {
-    int device = 0;
-    cudaError_t status = cudaGetDevice(&device);
-    if (status != cudaSuccess) return static_cast<int>(status);
-    if (workspace.device != -1 && workspace.device != device) {
-        return static_cast<int>(cudaErrorInvalidDevice);
-    }
-    if (workspace.device == -1) {
-        cudaDeviceProp properties{};
-        status = cudaGetDeviceProperties(&properties, device);
-        if (status != cudaSuccess) return static_cast<int>(status);
-        workspace.device = device;
-        workspace.compute_major = properties.major;
-    }
-    return 0;
-}
-
-int begin_workspace_use(cudaStream_t stream) {
-    if (workspace.ready == nullptr) {
-        cudaError_t status = cudaEventCreateWithFlags(
-            &workspace.ready, cudaEventDisableTiming);
-        if (status != cudaSuccess) return static_cast<int>(status);
-    }
-    if (workspace.event_recorded && workspace.last_stream != stream) {
-        cudaError_t status = cudaStreamWaitEvent(stream, workspace.ready, 0);
-        if (status != cudaSuccess) return static_cast<int>(status);
-    }
-    workspace.last_stream = stream;
-    return 0;
-}
-
-int finish_workspace_use(cudaStream_t stream, int operation_result) {
-    cudaError_t status = cudaEventRecord(workspace.ready, stream);
-    workspace.event_recorded = status == cudaSuccess;
-    if (operation_result != 0) return operation_result;
-    return status == cudaSuccess ? 0 : static_cast<int>(status);
-}
 
 int grow_buffer(void** pointer, size_t* capacity, size_t bytes) {
     if (*capacity >= bytes) return 0;
@@ -92,8 +69,14 @@ int grow_buffer(void** pointer, size_t* capacity, size_t bytes) {
     return 0;
 }
 
-int reserve_manual_workspace(size_t aq_bytes, size_t bq_bytes,
-                             size_t diagonal_bytes) {
+int reserve_workspace(size_t aq_bytes, size_t bq_bytes,
+                      size_t diagonal_bytes) {
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return static_cast<int>(status);
+    if (workspace.device != -1 && workspace.device != device) return 1;
+    workspace.device = device;
+
     int result = grow_buffer(reinterpret_cast<void**>(&workspace.aq),
                              &workspace.aq_capacity, aq_bytes);
     if (result != 0) return result;
@@ -104,21 +87,15 @@ int reserve_manual_workspace(size_t aq_bytes, size_t bq_bytes,
                          &workspace.diagonal_capacity, diagonal_bytes);
     if (result != 0) return result;
     if (workspace.max_bits == nullptr) {
-        cudaError_t status = cudaMalloc(&workspace.max_bits,
-                                        2 * sizeof(unsigned long long));
+        status = cudaMalloc(&workspace.max_bits,
+                            2 * sizeof(unsigned long long));
         if (status != cudaSuccess) return static_cast<int>(status);
     }
     if (workspace.scales == nullptr) {
-        cudaError_t status = cudaMalloc(&workspace.scales,
-                                        kScaleCount * sizeof(double));
+        status = cudaMalloc(&workspace.scales, kScaleCount * sizeof(double));
         if (status != cudaSuccess) return static_cast<int>(status);
     }
     return 0;
-}
-
-int reserve_vendor_workspace() {
-    return grow_buffer(&workspace.vendor, &workspace.vendor_capacity,
-                       kVendorWorkspaceBytes);
 }
 
 template <int BlockSize>
@@ -150,10 +127,10 @@ __global__ void maxabs_pair_kernel(const double* a, size_t elements_a,
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        atomicMax(max_bits, static_cast<unsigned long long>(
-                                __double_as_longlong(max_a[0])));
-        atomicMax(max_bits + 1, static_cast<unsigned long long>(
-                                    __double_as_longlong(max_b[0])));
+        atomicMax(max_bits,
+                  static_cast<unsigned long long>(__double_as_longlong(max_a[0])));
+        atomicMax(max_bits + 1,
+                  static_cast<unsigned long long>(__double_as_longlong(max_b[0])));
     }
 }
 
@@ -169,7 +146,6 @@ __global__ void prepare_scales_kernel(const unsigned long long* max_bits,
     double scale_b = max_b / 127.0;
     double inverse_a = 1.0 / scale_a;
     double inverse_b = 1.0 / scale_b;
-#pragma unroll
     for (int split = 0; split < kMaxSplits; ++split) {
         scales[kScaleA + split] = scale_a;
         scales[kInvScaleA + split] = inverse_a;
@@ -182,7 +158,6 @@ __global__ void prepare_scales_kernel(const unsigned long long* max_bits,
     }
 
     double diagonal_scale = scales[kScaleA] * scales[kScaleB];
-#pragma unroll
     for (int diagonal = 0; diagonal < 2 * kMaxSplits - 1; ++diagonal) {
         scales[kDiagonalScale + diagonal] = diagonal_scale;
         diagonal_scale /= 254.0;
@@ -198,8 +173,8 @@ __device__ __forceinline__ int8_t quantize_digit(double residual,
 }
 
 /*
- * Emit A as a column-major (S*K)-by-M matrix. Reversing split slots makes
- * every retained anti-diagonal addressable with the same leading dimension.
+ * A is emitted as a column-major (S*K)-by-M matrix. Split i occupies slot
+ * S-1-i so every anti-diagonal becomes a contiguous extended-K interval.
  */
 template <int Splits>
 __global__ void quantize_a_kernel(const double* input, int8_t* output,
@@ -243,6 +218,7 @@ __global__ void quantize_a_kernel(const double* input, int8_t* output,
     }
 }
 
+/* B is a column-major (S*K)-by-N matrix in ascending split order. */
 template <int Splits>
 __global__ void quantize_b_kernel(const double* input, int8_t* output,
                                   const double* scales, size_t elements,
@@ -287,27 +263,37 @@ __global__ void recombine_kernel(const int32_t* partial, double* output,
 }
 
 template <int Splits>
-constexpr int retained_diagonals() {
+constexpr int diagonal_count() {
+#if LAB45_DIAGONAL_MODE == 0
+    return 2 * Splits - 1;
+#elif LAB45_DIAGONAL_MODE == 1
+    return (Splits + 1 < 2 * Splits - 1) ? Splits + 1 : 2 * Splits - 1;
+#elif LAB45_DIAGONAL_MODE == 2
+    return Splits;
+#else
     return Splits < 6 ? Splits : 6;
+#endif
 }
 
 template <int Splits>
-int run_manual(int M, int N, int K, const double* dA, const double* dB,
-               double* dC, cublasHandle_t handle, cudaStream_t stream) {
-    constexpr int Diagonals = retained_diagonals<Splits>();
+int run_gemm(int M, int N, int K, const double* dA, const double* dB,
+             double* dC, cublasHandle_t handle, cudaStream_t stream) {
+    constexpr int Diagonals = diagonal_count<Splits>();
     const size_t elements_a = static_cast<size_t>(M) * K;
     const size_t elements_b = static_cast<size_t>(K) * N;
     const size_t elements_c = static_cast<size_t>(M) * N;
     const size_t aq_bytes = static_cast<size_t>(Splits) * elements_a;
     const size_t bq_bytes = static_cast<size_t>(Splits) * elements_b;
+#if LAB45_USE_WMMA
+    const size_t diagonal_bytes = sizeof(int32_t);
+#else
     const size_t diagonal_bytes = static_cast<size_t>(Diagonals) * elements_c
                                 * sizeof(int32_t);
-    int result = reserve_manual_workspace(aq_bytes, bq_bytes,
-                                          diagonal_bytes);
+#endif
+    int result = reserve_workspace(aq_bytes, bq_bytes, diagonal_bytes);
     if (result != 0) return result;
 
     CUBLAS_CHECK(cublasSetStream(handle, stream));
-    CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
     CUDA_CHECK(cudaMemsetAsync(workspace.max_bits, 0,
                                2 * sizeof(unsigned long long), stream));
@@ -333,6 +319,20 @@ int run_manual(int M, int N, int K, const double* dA, const double* dB,
         dB, workspace.bq, workspace.scales, elements_b, K);
     CUDA_CHECK(cudaPeekAtLastError());
 
+#if LAB45_USE_WMMA
+    if ((M % lab45_mma_ldmatrix::kCtaM) == 0 &&
+        (N % lab45_mma_ldmatrix::kCtaN) == 0 &&
+        (K % lab45_mma_ldmatrix::kCtaK) == 0) {
+        const dim3 grid(N / lab45_mma_ldmatrix::kCtaN,
+                        M / lab45_mma_ldmatrix::kCtaM);
+        lab45_mma_ldmatrix::groupwise_mma_kernel<Splits, Diagonals>
+            <<<grid, lab45_mma_ldmatrix::kThreads, 0, stream>>>(
+                workspace.aq, workspace.bq, dC,
+                workspace.scales + kDiagonalScale, M, N, K);
+        CUDA_CHECK(cudaPeekAtLastError());
+        return 0;
+    }
+#endif
     const int32_t alpha = 1;
     const int32_t beta_zero = 0;
     const int32_t beta_one = 1;
@@ -352,8 +352,9 @@ int run_manual(int M, int N, int K, const double* dA, const double* dB,
                 workspace.aq + static_cast<size_t>(a_slot) * K,
                 CUDA_R_8I, extended_k,
                 workspace.bq + static_cast<size_t>(j) * K,
-                CUDA_R_8I, extended_k, beta, output, CUDA_R_32I, M,
-                CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+                CUDA_R_8I, extended_k,
+                beta, output, CUDA_R_32I, M, CUBLAS_COMPUTE_32I,
+                kGemmAlgo));
             first = false;
         }
     }
@@ -366,68 +367,24 @@ int run_manual(int M, int N, int K, const double* dA, const double* dB,
     return 0;
 }
 
-int run_vendor(int M, int N, int K, const double* dA, const double* dB,
-               double* dC, int splits, cublasHandle_t handle,
-               cudaStream_t stream) {
-    int result = reserve_vendor_workspace();
-    if (result != 0) return result;
-
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
-    CUBLAS_CHECK(cublasSetWorkspace(handle, workspace.vendor,
-                                    kVendorWorkspaceBytes));
-    CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
-    CUBLAS_CHECK(cublasSetMathMode(
-        handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
-    CUBLAS_CHECK(cublasSetEmulationStrategy(
-        handle, CUBLAS_EMULATION_STRATEGY_EAGER));
-    CUBLAS_CHECK(cublasSetFixedPointEmulationMantissaControl(
-        handle, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
-    int max_mantissa_bits = 8 * splits;
-    if (max_mantissa_bits > 55) max_mantissa_bits = 55;
-    CUBLAS_CHECK(cublasSetFixedPointEmulationMaxMantissaBitCount(
-        handle, max_mantissa_bits));
-
-    const double alpha = 1.0;
-    const double beta = 0.0;
-    CUBLAS_CHECK(cublasGemmEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha,
-        dA, CUDA_R_64F, M, dB, CUDA_R_64F, K, &beta, dC, CUDA_R_64F, M,
-        CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT, CUBLAS_GEMM_DEFAULT));
-    return 0;
-}
-
 }  // namespace
 
-extern "C" int gemm_my_int8_fp64(
-    int M, int N, int K, const double* dA, const double* dB, double* dC,
-    int splits, cublasHandle_t handle, cudaStream_t stream) {
+int gemm_my_int8_fp64(int M, int N, int K,
+                      const double* dA, const double* dB, double* dC,
+                      int splits, cublasHandle_t handle, cudaStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0 || dA == nullptr || dB == nullptr ||
-        dC == nullptr || handle == nullptr || splits < 1 ||
-        splits > kMaxSplits) {
+        dC == nullptr || handle == nullptr) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
-    int result = initialize_device();
-    if (result != 0) return result;
-    result = begin_workspace_use(stream);
-    if (result != 0) return result;
-
-    // The published grader is Hopper; the currently exposed lab partition is
-    // Ampere. Keep each architecture on its measured best implementation.
-    if (workspace.compute_major >= 9) {
-        result = run_vendor(M, N, K, dA, dB, dC, splits, handle, stream);
-        return finish_workspace_use(stream, result);
-    }
-
     switch (splits) {
-        case 1: result = run_manual<1>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 2: result = run_manual<2>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 3: result = run_manual<3>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 4: result = run_manual<4>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 5: result = run_manual<5>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 6: result = run_manual<6>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 7: result = run_manual<7>(M, N, K, dA, dB, dC, handle, stream); break;
-        case 8: result = run_manual<8>(M, N, K, dA, dB, dC, handle, stream); break;
-        default: result = static_cast<int>(cudaErrorInvalidValue); break;
+        case 1: return run_gemm<1>(M, N, K, dA, dB, dC, handle, stream);
+        case 2: return run_gemm<2>(M, N, K, dA, dB, dC, handle, stream);
+        case 3: return run_gemm<3>(M, N, K, dA, dB, dC, handle, stream);
+        case 4: return run_gemm<4>(M, N, K, dA, dB, dC, handle, stream);
+        case 5: return run_gemm<5>(M, N, K, dA, dB, dC, handle, stream);
+        case 6: return run_gemm<6>(M, N, K, dA, dB, dC, handle, stream);
+        case 7: return run_gemm<7>(M, N, K, dA, dB, dC, handle, stream);
+        case 8: return run_gemm<8>(M, N, K, dA, dB, dC, handle, stream);
+        default: return static_cast<int>(cudaErrorInvalidValue);
     }
-    return finish_workspace_use(stream, result);
 }

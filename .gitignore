@@ -8,3 +8,9 @@ benchmark
 *.sqlite
 tools/int8_gemm_probe
 tools/pair_pruning_probe
+tools/benchmark_*
+!tools/benchmark_my.cu
+tools/diagonal_concat_probe
+tools/int8_lt_algo_scan
+tools/multistream_probe
+tools/*.patch

@@ -319,7 +319,8 @@ extern "C" int gemm_my_int8_fp64(int M, int N, int K,
 
     if (diagonal_accumulation_safe) {
         double diagonal_scale = scale_a0 * scale_b0;
-        for (int diagonal = 0; diagonal <= 2 * splits - 2; ++diagonal) {
+        const int diagonal_limit = splits < 6 ? splits : 6;
+        for (int diagonal = 0; diagonal < diagonal_limit; ++diagonal) {
             const int begin_i = diagonal < splits ? 0 : diagonal - splits + 1;
             const int end_i = diagonal < splits ? diagonal : splits - 1;
             bool first = true;

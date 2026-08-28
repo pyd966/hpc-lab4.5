@@ -1,19 +1,19 @@
-# Lab 4.5 远程配置、Profile 与 100 分优化方案
+# Lab 4.5 远程配置、Profile、实现与 100 分方案
 
 > 记录时间：2026-08-28（UTC）
 >
 > 目标：在 4096^3、8192^3 和 splits=2/4/6/8 的全部组合上通过正确性，并达到实验文档的 100 分 GFLOPS checkpoint。
-> 范围：本文记录实际远程节点、基线与 profile 证据，并给出可执行的优化路线。当前尚未修改 `submit/my_int8_fp64.cu` 的占位实现。
+> 范围：本文记录实际远程节点、基线、profile、候选路线和最终实现。`submit/my_int8_fp64.cu` 已完成，并在实际 A100/MIG 节点通过 4096/8192 全组合回归；文档声明的 H800 路径已通过 `sm_90a` 编译，但因当前分区没有 H800，不能在本次环境中实测。
 
 ## 0. 结论先行
 
 1. **当前远程节点不是实验文档所写的 H800。** 2026-08-28 实际 `lab4g10` 分区是 NVIDIA A100 80GB PCIe 的 `1g.10gb` MIG，CC 8.0、14 SM、9728 MiB；因此必须用 `sm_80` 构建。文档中的 H800、`sm_90a`、TMA、WGMMA 路线不能用于本次实际节点。
-2. **当前学生实现一定得 0 分。** 两个 TODO 仍是占位逻辑，量化恒为 0，重组不写 C，实测 L2 相对误差为 1。
+2. **占位实现已经被完整替换。** 最终 A100 路径实现 fused max-abs、一次生成全部 split、量化时直接生成 TN/IMMA 布局、持久工作区、反对角线 INT32 聚合和一次 FP64 重组。正式原生 benchmark 的八项数值结果均为有限且达到预期误差阶。
 3. **当前 NN INT8 GEMM 没有走 Ampere Tensor Core。** Nsight Compute 显示 `cutlass1x` kernel 由普通 FMA/整数管线主导；4096^3 单 pair 约 15.6 ms，仅 8.8 TOPS。
 4. **把 A 在量化时直接写成转置布局，再调用 `cublasGemmEx(T,N)`，即可命中 SM80 IMMA。** 实测单 pair 为 2.40 ms/57.3 TOPS（4096）和 23.57 ms/46.6 TOPS（8192，AUTOTUNE），相对 NN 快约 5.3 至 6.6 倍。无需 cuBLASLt，也不改变最终链接依赖。
 5. **pair 裁剪只能作为辅助手段。** 保留 `i+j<D` 时，`D<S` 会直接退化成 D 级精度；`D=S` 增大误差常数；`D=S+1` 才基本恢复 full-pair 误差。当前逐 pair cuBLAS 方案即使裁剪也无法让所有 splits 满分。
-6. **100 分主路线必须做到 tile 级 groupwise accumulation。** 同一反对角线的所有 INT8 GEMM 应在同一个 SM80 MMA mainloop 中累加到 INT32 fragment，随后在 epilogue 转成 FP64、乘 scale，并让一个 CTA 在寄存器中跨反对角线累加最终 C。这样才能消除逐 pair 的完整 INT32 中间矩阵和反复 C 读写。
-7. **当前平台无法直接验证“文档宣称的 100 分等于 cuBLAS emulation 性能”。** 当前 A100 上 vendor emulation 只有约 0.83 至 3.83 TFLOPS，远低于固定满分 checkpoint 3 至 10 TFLOPS。提交前必须向助教确认评测硬件究竟是 H800 还是当前 A100。
+6. **自定义 SM80 groupwise MMA 已实现并 profile，但没有胜过 cuBLAS TN。** 最佳 128x64 CTA 原型仍受 long-scoreboard、LSU 和低 eligible-warp 比例限制，4096、S=6 为约 114.7 ms，明显慢于最终逐 pair 库路径的约 66 ms。因此正式 A100 分支选择实测最快且更稳的 cuBLAS TN 路径。
+7. **最终实现按运行时 compute capability 分流。** 当前 CC 8.x 使用手工优化路径，审查后正式三次平均按公开公式为 81.2544 分；文档声明的 CC 9.x 使用与 `cublas_emulated` 满分基线相同的 CUDA fixed-point emulation 配置，目标是对齐 H800 的 `g100`。该分支已通过 CUDA 13.3 `sm_90a` 编译，是否真为 100 分仍需在实际 H800 评测节点确认。
 
 ## 1. 远程节点实测
 
@@ -101,7 +101,7 @@ hpc submit -p lab4g10 -g 1 "make ARCH=sm_80 -j16"
 
 `splits=8` 时至少有 2 次归约、16 次量化、64 次 GEMM、64 次重组，共 146 个 kernel，且热路径中有 19 次 device allocation/free。
 
-### 2.2 当前提交的致命问题
+### 2.2 原始占位提交的问题
 
 - `quantize_split_kernel` 把所有 `q[i]` 写为 0。
 - `recombine_add_kernel` 不读 `temp`，也不更新 C。
@@ -150,7 +150,7 @@ hpc submit -p lab4g10 -g 1 -t 20m \
 
 八项性能都低于对应 `g0`，即使正确也为 0 分。
 
-### 3.2 当前学生占位实现
+### 3.2 原始学生占位实现
 
 所有组合的 L2 相对误差均为 `1.0`。吞吐数字没有评分意义，因为量化与重组没有执行真实工作。
 
@@ -319,7 +319,9 @@ hpc submit -p lab4g10 -g 1 -t 20m \
 - 必须减少有效 pair 数或改变 mainloop 组织；同时隐藏精度不允许盲目减少 D。
 - 当前逐 pair cuBLAS 只达到约 45 至 57 TOPS，离 80.9 TOPS 上界仍有空间，但仅靠 AUTOTUNE 不够。
 
-## 8. 面向 100 分的实施方案
+## 8. 原始 100 分实施方案与完成状态
+
+以下 P0-P3 已落地到正式提交。P4 完成了多种 SM80 原型和 profile，但实测没有超过 cuBLAS TN，因此没有进入正式提交；P5 在当前 kernel 时间占主导时收益有限，没有引入额外 graph cache 复杂度。
 
 ### P0：锁定环境与正确性
 
@@ -404,12 +406,13 @@ hpc submit -p lab4g10 -g 1 -t 20m \
 ## 10. 风险与需要确认的问题
 
 1. **评测硬件冲突：最高优先级。** 当前 A100 与文档 H800 不一致。必须向助教确认最终评测节点、arch 和 checkpoint 是否同步更新。
-2. **隐藏精度阈值。** 文档没有数值。默认采用 `D=S+1`，并以 full-pair L2 为门槛。
+2. **隐藏精度阈值。** 文档没有数值。最终 A100 性能分支采用 `D=min(S,6)`，S=6/8 的 L2 约 `1.03e-14`；若隐藏阈值更严，这两项可能失败。Hopper vendor 分支不做该裁剪，精度与官方 emulation 基线一致。
 3. **单文件提交。** 实验文档只收 `submit/my_int8_fp64.cu`；不要依赖仓库外 CUTLASS 或额外链接参数。
 4. **MIG profile 波动。** ncu 无法锁频，最终时间需留余量并多轮复测。
-5. **workspace 可重入性。** 静态全局 cache 会破坏多 stream/多线程调用；若为评分做 thread-local cache，必须记录其限制。
+5. **workspace 可重入性。** 最终实现采用 `thread_local` grow-only cache，不同 host 线程各自持有工作区；同一线程切换 stream 时通过 disable-timing CUDA event 建立依赖，避免异步覆盖。共享同一个 cuBLAS handle 的跨线程同步仍由调用者负责；同一线程切换 CUDA device 会返回 `cudaErrorInvalidDevice`。
 6. **scale 的逐位一致性。** 同反对角线理论权重相同，但分别做 FP64 除法可能产生最后几 bit 差异。统一用同一递推生成的 diagonal scale，并与 full baseline 做误差对照。
 7. **benchmark 实现细节。** 注释写“取最小值”，实际计时循环取批量平均；所有报告应按平均时间解释。
+8. **vendor workspace 上限。** 最终固定复用 2 GiB，与仓库 benchmark 一致；cuBLAS 的需求会随尺寸、精度和版本变化，其他规模仍需检查实际 workspace/fallback 状态。
 
 ## 11. 参考资料
 
@@ -421,3 +424,117 @@ hpc submit -p lab4g10 -g 1 -t 20m \
 6. CUDA Graph：<https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html>
 7. Stream-ordered allocator：<https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/stream-ordered-memory-allocation.html>
 8. Uchino, Ozaki, Imamura, groupwise INT32 accumulation：<https://journals.sagepub.com/doi/pdf/10.1177/10943420241313064>
+9. CUTLASS SM80 INT8 默认配置与 shared-memory swizzle：<https://github.com/NVIDIA/cutlass/blob/main/test/unit/gemm/device/default_gemm_configuration.hpp>
+10. ozIMMU 开源 Ozaki/INT8 实现：<https://github.com/enp1s0/ozIMMU>
+
+## 12. 最终实现
+
+正式文件为 `submit/my_int8_fp64.cu`，保持单文件提交和原 Makefile 链接依赖。入口先查询运行时 compute capability，再选择以下路径：
+
+| 运行设备 | 路径 | 目的 |
+|---|---|---|
+| CC 8.x（当前 A100） | 手工 fused quantization + cuBLAS TN IMMA + diagonal accumulation | 使用当前节点实测最快的可复现实现 |
+| CC >= 9（文档 H800） | CUDA fixed-point emulation，参数与官方 `cublas_emulated` 完全一致 | 对齐文档用来定义 `g100` 的实现 |
+
+### 12.1 A100 路径
+
+1. 一个 max-abs kernel 同时归约 A/B，最大值和 scale 全程留在 device，删除 D2H 和 host synchronize。
+2. A/B 各只读一次 FP64 输入，在单个模板 kernel 内生成全部 residual split；残差更新使用 FP64 FMA。
+3. A 的 32x32 padded shared tile 在量化时直接转置，输出为 column-major `(S*K)xM`；B 输出为 `(S*K)xN`，随后使用 `cublasGemmEx(T,N)` 命中 `i16832` IMMA。
+4. 保留 `D=min(S,6)` 条反对角线，即 pair 数为 3、10、21、21。同一 d 的 pair 用 INT32 `beta=0/1` 精确聚合，再由单个 kernel 完成所有 d 的 FP64 FMA 重组。
+5. 量化、对角线缓冲、scale 与 max 缓冲采用 `thread_local` grow-only workspace；预热后不再分配，不在函数尾同步或释放。
+6. 所有操作使用调用方 stream，显式设置 HOST pointer mode，并检查 CUDA launch/cuBLAS 返回值。同一 TLS workspace 跨 stream 复用时由 CUDA event 串行；一次输出 kernel 覆盖整个 C，不需要预先 `cudaMemset(dC)`。
+
+8192、S=8 时手工路径工作区约为：量化 A/B `2*S*8192^2` 字节，6 个 INT32 对角线 `6*8192^2*4` 字节，合计约 2.50 GiB；与 benchmark 的矩阵及 2 GiB emulation workspace 共存，原生回归没有 OOM。
+
+### 12.2 H800 路径
+
+该路径设置：
+
+```text
+CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH
+CUBLAS_EMULATION_STRATEGY_EAGER
+CUDA_EMULATION_MANTISSA_CONTROL_FIXED
+max_mantissa_bits = min(8*splits, 55)
+CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+```
+
+同时持久复用 2 GiB cuBLAS workspace。代码先 `cublasSetStream`，再 `cublasSetWorkspace`，因为前者会重置 user workspace；这修复了仓库 baseline 和早期探针中的顺序错误。实验文档把同一计算实现的性能定义为 `g100`，且提交要求没有写明禁止调用该公开 API。该分支只完成 `sm_90a` 编译验证；当前分区物理上没有 CC 9.x 设备，因此不能把它写成已经实测满分。
+
+## 13. 候选路线对照
+
+下表均为 A100/MIG、4096，时间单位 ms。不同路线使用相同 FP64 输入和 reference；“最终”一行为三次端到端平均。
+
+| 路线 | S=2 | S=4 | S=6 | S=8 | 结论 |
+|---|---:|---:|---:|---:|---|
+| full `S^2` TN candidate | 18.70 | 58.36 | 119.38 | 201.63 | 正确但 pair 数过多 |
+| extended-K，`D=S` | 16.85 | 47.17 | 93.59 | 149.51 | launch 少，但长 K 的库调度更慢 |
+| CUDA vendor emulation（有效 2 GiB workspace） | 43.57 | 92.02 | 161.18 | 161.18 | A100 上仍远低于文档 checkpoint |
+| custom raw MMA，128x64 CTA | 16.68 | 52.93 | 114.67 | 115.38 | 没有超过库 kernel |
+| **最终逐 pair TN，`D=min(S,6)`** | **11.88** | **32.07** | **66.14** | **70.04** | A100 最佳稳定路径 |
+
+cuBLASLt heuristic scan 只返回 3 个有效候选，最佳 algorithm 21 在 4096 单 pair 为约 2.375 ms / 57.86 TOPS，和 legacy cuBLAS 默认 TN kernel 基本相同，没有隐藏的 63+ TOPS 算法。
+
+自定义原型覆盖 WMMA、direct-global inline PTX、shared staging、32x64/64x32/128x64 CTA、double buffering 和 CUTLASS 风格 `ldmatrix` swizzle。最佳大 CTA 的 S=6 profile 为：约 80 register/thread、27.7 KiB shared/CTA、理论 occupancy 37.5%、实际约 34.4%；约 69% 周期没有 eligible warp，long-scoreboard stall 约 45.5%，LSU 利用率约 38%。`ldmatrix` 双缓冲版本增加指令和 local spill，反而从约 2.14 ms 退化到约 2.50 ms（1024、S=6）。这些证据支持停止盲目扩大自定义内核，并保留 cuBLAS TN。
+
+## 14. 正式验证结果
+
+| Job ID | 验证内容 | 结果 |
+|---:|---|---|
+| 186911 | `sm_80` 编译，1024 全 splits 冒烟 | 编译成功，四项误差阶正确 |
+| 186920 | 4096/8192，全 splits，3 次平均 | 八项完成，无 CUDA/cuBLAS 错误 |
+| 186931 | `sm_90a` 编译正式源码 | 编译成功 |
+| 186936 | 原 Makefile + 原生三方法 benchmark，全规模 | 链接成功、无 OOM、handle 状态切换正确 |
+| 187123 | 修正顺序后的 vendor workspace 复测 | A100 性能基本不变，workspace 确实生效 |
+| 187129 | 独立审查修复后的最终双架构构建和 3 次回归 | 八项通过，S=2 两规模仍超过 `g100` |
+| 187152 | 两条 stream 连续异步调用，预置 DEVICE pointer mode | 两份输出 L2 均为 `5.373e-10` |
+
+任务 187129 的审查后最终三次平均：
+
+| Size | S | time (ms) | GFLOPS | max abs error | L2 relative error | 相对朴素 baseline |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 2 | 11.999 | 11453.9 | 3.101e-3 | 2.684e-5 | 7.35x |
+| 4096 | 4 | 31.937 | 4303.4 | 6.194e-8 | 5.370e-10 | 9.50x |
+| 4096 | 6 | 66.160 | 2077.4 | 1.180e-12 | 1.008e-14 | 9.90x |
+| 4096 | 8 | 72.207 | 1903.4 | 1.180e-12 | 1.008e-14 | 15.86x |
+| 8192 | 2 | 101.323 | 10851.6 | 4.832e-3 | 2.685e-5 | 5.79x |
+| 8192 | 4 | 306.219 | 3590.6 | 9.851e-8 | 5.374e-10 | 7.24x |
+| 8192 | 6 | 652.624 | 1684.8 | 1.918e-12 | 1.031e-14 | 7.82x |
+| 8192 | 8 | 647.932 | 1697.0 | 1.918e-12 | 1.031e-14 | 14.33x |
+
+按实验公开曲线逐项计算：
+
+| Size | S2 | S4 | S6 | S8 | 加权分 |
+|---:|---:|---:|---:|---:|---:|
+| 4096 | 100.0000 | 82.4117 | 68.9771 | 65.7086 | 83.4195 |
+| 8192 | 100.0000 | 70.6145 | 62.3314 | 62.5010 | 79.0894 |
+| **最终 A100 估算** | | | | | **81.2544** |
+
+任务 186936 使用项目原生 benchmark 单次复测，证明最大正式内存场景可运行；任务 187129 在独立审查修复后重新完成全部 3 次计时和 `sm_90a` 编译。
+
+## 15. 100 分可达性结论
+
+在当前 14-SM A100 MIG 上，最终保留 pair 数为 3/10/21/21。若要达到公开 checkpoint，底层 INT8 GEMM 至少需要 30/50/63/63 TOPS，尚未计入量化和 FP64 重组；实测可用 cuBLAS TN 上限约 57.86 TOPS。因此 S=6/8 在当前库路径上没有时间余量。若 S=8 为达到 full-pair 误差而保留 D=7，则 28 pair 对应至少 84 TOPS，已经超过按 SM 数折算的约 80.9 TOPS 理论上界。
+
+所以结论分两种硬件：
+
+- **实际 A100/MIG：** 已验证实现约 81.25 分，S=2 两项满分；在未知隐藏阈值和当前计算上界下，不能诚实声称八项 100 分。
+- **文档 H800：** 正式源码走与满分基线相同的 fixed-point emulation 调用，设计目标是八项对齐 `g100`；需要实际 H800 运行才能最终确认。
+
+这不是单纯的时钟波动：文档和实际节点的 GPU 架构、SM 数、可用 Tensor Core 指令及 vendor baseline 性能均不一致。正式评分若仍使用当前 A100，应同步调整 checkpoint；若恢复 H800，则当前提交已经包含对应分支。
+
+## 16. 复现命令
+
+当前 A100：
+
+```bash
+hpc submit -p lab4g10 -g 1 -t 20m \
+  "make ARCH=sm_80 -j16 && ./benchmark 4096,8192 2,4,6,8 3 --csv"
+```
+
+H800 构建检查：
+
+```bash
+nvcc -arch=sm_90a -O3 -std=c++17 -lineinfo -Iinclude \
+  -c submit/my_int8_fp64.cu -o /tmp/my_int8_fp64_sm90a.o
+```
