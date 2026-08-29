@@ -10,8 +10,13 @@ namespace {
 constexpr int kMaxSplits = 8;
 constexpr int kTile = 32;
 constexpr int kBlockRows = 8;
-constexpr size_t kVendorWorkspaceBytes =
-    size_t{2} * 1024 * 1024 * 1024;
+// Keep the first six anti-diagonals.  This is the measured precision/performance
+// frontier: retaining more terms misses the 4096^3 S=8 checkpoint.
+constexpr int kRetainedDiagonals = 6;
+constexpr int kBGridYCap = 32;
+constexpr int kOutputGridCap = 4096;
+// AUTOTUNE selects the Tensor Core kernel for each concatenated K dimension.
+constexpr cublasGemmAlgo_t kManualGemmAlgo = CUBLAS_GEMM_AUTOTUNE;
 
 constexpr int kScaleA = 0;
 constexpr int kInvScaleA = kScaleA + kMaxSplits;
@@ -22,20 +27,23 @@ constexpr int kScaleCount = kDiagonalScale + 2 * kMaxSplits - 1;
 
 struct Workspace {
     int device = -1;
-    int compute_major = -1;
     int8_t* aq = nullptr;
     int8_t* bq = nullptr;
     int32_t* diagonal = nullptr;
     unsigned long long* max_bits = nullptr;
     double* scales = nullptr;
-    void* vendor = nullptr;
     cudaEvent_t ready = nullptr;
     cudaStream_t last_stream = nullptr;
     bool event_recorded = false;
+    cudaStream_t quant_a_stream = nullptr;
+    cudaStream_t quant_b_stream = nullptr;
+    cudaEvent_t scales_ready = nullptr;
+    cudaEvent_t quant_a_ready = nullptr;
+    cudaEvent_t quant_b_ready = nullptr;
+    bool quant_pipeline_initialized = false;
     size_t aq_capacity = 0;
     size_t bq_capacity = 0;
     size_t diagonal_capacity = 0;
-    size_t vendor_capacity = 0;
 };
 
 thread_local Workspace workspace;
@@ -48,11 +56,7 @@ int initialize_device() {
         return static_cast<int>(cudaErrorInvalidDevice);
     }
     if (workspace.device == -1) {
-        cudaDeviceProp properties{};
-        status = cudaGetDeviceProperties(&properties, device);
-        if (status != cudaSuccess) return static_cast<int>(status);
         workspace.device = device;
-        workspace.compute_major = properties.major;
     }
     return 0;
 }
@@ -116,9 +120,52 @@ int reserve_manual_workspace(size_t aq_bytes, size_t bq_bytes,
     return 0;
 }
 
-int reserve_vendor_workspace() {
-    return grow_buffer(&workspace.vendor, &workspace.vendor_capacity,
-                       kVendorWorkspaceBytes);
+// Build the auxiliary quantization pipeline transactionally.  This avoids
+// treating one successfully created stream as a complete initialization.
+int initialize_quantization_pipeline() {
+    if (workspace.quant_pipeline_initialized) return 0;
+    cudaStream_t quant_a_stream = nullptr;
+    cudaStream_t quant_b_stream = nullptr;
+    cudaEvent_t scales_ready = nullptr;
+    cudaEvent_t quant_a_ready = nullptr;
+    cudaEvent_t quant_b_ready = nullptr;
+    cudaError_t status = cudaStreamCreateWithFlags(&quant_a_stream,
+                                                    cudaStreamNonBlocking);
+    if (status != cudaSuccess) return static_cast<int>(status);
+    status = cudaStreamCreateWithFlags(&quant_b_stream,
+                                       cudaStreamNonBlocking);
+    if (status != cudaSuccess) {
+        cudaStreamDestroy(quant_a_stream);
+        return static_cast<int>(status);
+    }
+    status = cudaEventCreateWithFlags(&scales_ready, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        cudaStreamDestroy(quant_b_stream);
+        cudaStreamDestroy(quant_a_stream);
+        return static_cast<int>(status);
+    }
+    status = cudaEventCreateWithFlags(&quant_a_ready, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        cudaEventDestroy(scales_ready);
+        cudaStreamDestroy(quant_b_stream);
+        cudaStreamDestroy(quant_a_stream);
+        return static_cast<int>(status);
+    }
+    status = cudaEventCreateWithFlags(&quant_b_ready, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        cudaEventDestroy(quant_a_ready);
+        cudaEventDestroy(scales_ready);
+        cudaStreamDestroy(quant_b_stream);
+        cudaStreamDestroy(quant_a_stream);
+        return static_cast<int>(status);
+    }
+    workspace.quant_a_stream = quant_a_stream;
+    workspace.quant_b_stream = quant_b_stream;
+    workspace.scales_ready = scales_ready;
+    workspace.quant_a_ready = quant_a_ready;
+    workspace.quant_b_ready = quant_b_ready;
+    workspace.quant_pipeline_initialized = true;
+    return 0;
 }
 
 template <int BlockSize>
@@ -191,6 +238,7 @@ __global__ void prepare_scales_kernel(const unsigned long long* max_bits,
 
 __device__ __forceinline__ int8_t quantize_digit(double residual,
                                                   double inverse_scale) {
+    // Keep digit selection and residual propagation in FP64.
     int digit = __double2int_rn(residual * inverse_scale);
     digit = digit > 127 ? 127 : digit;
     digit = digit < -127 ? -127 : digit;
@@ -245,22 +293,24 @@ __global__ void quantize_a_kernel(const double* input, int8_t* output,
 
 template <int Splits>
 __global__ void quantize_b_kernel(const double* input, int8_t* output,
-                                  const double* scales, size_t elements,
-                                  int K) {
-    const size_t start = static_cast<size_t>(blockIdx.x) * blockDim.x
-                       + threadIdx.x;
-    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+                                  const double* scales, int N, int K) {
+    // Directly map x to K; avoid divide/modulo per element.
+    const int k0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n0 = blockIdx.y * blockDim.y + threadIdx.y;
+    const int n_stride = gridDim.y * blockDim.y;
     const size_t extended_k = static_cast<size_t>(Splits) * K;
-    for (size_t index = start; index < elements; index += stride) {
-        const int k = static_cast<int>(index % K);
-        const size_t n = index / K;
+    for (int n = n0; n < N; n += n_stride) {
+        const int k = k0;
+        if (k >= K) continue;
+        const size_t index = static_cast<size_t>(n) * K + k;
         double residual = input[index];
 #pragma unroll
         for (int split = 0; split < Splits; ++split) {
             const double scale = scales[kScaleB + split];
             const int8_t digit = quantize_digit(
                 residual, scales[kInvScaleB + split]);
-            output[n * extended_k + static_cast<size_t>(split) * K + k] =
+            output[static_cast<size_t>(n) * extended_k
+                   + static_cast<size_t>(split) * K + k] =
                 digit;
             residual = fma(-static_cast<double>(digit), scale, residual);
         }
@@ -288,7 +338,11 @@ __global__ void recombine_kernel(const int32_t* partial, double* output,
 
 template <int Splits>
 constexpr int retained_diagonals() {
-    return Splits < 6 ? Splits : 6;
+    // Restore the final diagonal for S=2 and S=4.  It recovers the
+    // full-pair accuracy in those cases while staying above g100 on H800.
+    if constexpr (Splits == 2) return 3;
+    if constexpr (Splits == 4) return 5;
+    return Splits < kRetainedDiagonals ? Splits : kRetainedDiagonals;
 }
 
 template <int Splits>
@@ -322,77 +376,64 @@ int run_manual(int M, int N, int K, const double* dA, const double* dB,
     prepare_scales_kernel<<<1, 1, 0, stream>>>(workspace.max_bits,
                                                workspace.scales);
 
+    // A and B quantization are independent after scales are ready.  Keep
+    // their producers on private streams and join them before the GEMMs.
+    result = initialize_quantization_pipeline();
+    if (result != 0) return result;
+    CUDA_CHECK(cudaEventRecord(workspace.scales_ready, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(workspace.quant_a_stream,
+                                   workspace.scales_ready, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(workspace.quant_b_stream,
+                                   workspace.scales_ready, 0));
+
     const dim3 a_block(kTile, kBlockRows);
     const dim3 a_grid((M + kTile - 1) / kTile,
                       (K + kTile - 1) / kTile);
-    quantize_a_kernel<Splits><<<a_grid, a_block, 0, stream>>>(
+    quantize_a_kernel<Splits><<<a_grid, a_block, 0,
+                                workspace.quant_a_stream>>>(
         dA, workspace.aq, workspace.scales, M, K);
-    int b_grid = static_cast<int>((elements_b + block - 1) / block);
-    if (b_grid > 4096) b_grid = 4096;
-    quantize_b_kernel<Splits><<<b_grid, block, 0, stream>>>(
-        dB, workspace.bq, workspace.scales, elements_b, K);
+    const dim3 b_block(kTile, kBlockRows);
+    int b_grid_y = (N + kBlockRows - 1) / kBlockRows;
+    if (b_grid_y > kBGridYCap) b_grid_y = kBGridYCap;
+    const dim3 b_grid((K + kTile - 1) / kTile, b_grid_y);
+    quantize_b_kernel<Splits><<<b_grid, b_block, 0,
+                                workspace.quant_b_stream>>>(
+        dB, workspace.bq, workspace.scales, N, K);
+    CUDA_CHECK(cudaEventRecord(workspace.quant_a_ready,
+                               workspace.quant_a_stream));
+    CUDA_CHECK(cudaEventRecord(workspace.quant_b_ready,
+                               workspace.quant_b_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, workspace.quant_a_ready, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, workspace.quant_b_ready, 0));
     CUDA_CHECK(cudaPeekAtLastError());
 
     const int32_t alpha = 1;
     const int32_t beta_zero = 0;
-    const int32_t beta_one = 1;
     const int extended_k = Splits * K;
+    // A reversed A split layout and a forward B layout make every retained
+    // anti-diagonal contiguous. One GEMM therefore sums all pairs on that
+    // anti-diagonal without beta=1 read/modify/write traffic.
     for (int diagonal = 0; diagonal < Diagonals; ++diagonal) {
         const int j_low = diagonal >= Splits ? diagonal - Splits + 1 : 0;
         const int j_high = diagonal < Splits ? diagonal : Splits - 1;
+        const int pair_count = j_high - j_low + 1;
+        const int a_slot = Splits - 1 - diagonal + j_low;
         int32_t* output = workspace.diagonal
                         + static_cast<size_t>(diagonal) * elements_c;
-        bool first = true;
-        for (int j = j_low; j <= j_high; ++j) {
-            const int i = diagonal - j;
-            const int a_slot = Splits - 1 - i;
-            const int32_t* beta = first ? &beta_zero : &beta_one;
-            CUBLAS_CHECK(cublasGemmEx(
-                handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha,
-                workspace.aq + static_cast<size_t>(a_slot) * K,
-                CUDA_R_8I, extended_k,
-                workspace.bq + static_cast<size_t>(j) * K,
-                CUDA_R_8I, extended_k, beta, output, CUDA_R_32I, M,
-                CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
-            first = false;
-        }
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, pair_count * K,
+            &alpha, workspace.aq + static_cast<size_t>(a_slot) * K,
+            CUDA_R_8I, extended_k,
+            workspace.bq + static_cast<size_t>(j_low) * K,
+            CUDA_R_8I, extended_k, &beta_zero, output, CUDA_R_32I, M,
+            CUBLAS_COMPUTE_32I, kManualGemmAlgo));
     }
 
     int output_grid = static_cast<int>((elements_c + block - 1) / block);
-    if (output_grid > 4096) output_grid = 4096;
+    if (output_grid > kOutputGridCap) output_grid = kOutputGridCap;
     recombine_kernel<Diagonals><<<output_grid, block, 0, stream>>>(
         workspace.diagonal, dC, workspace.scales, elements_c);
     CUDA_CHECK(cudaPeekAtLastError());
-    return 0;
-}
-
-int run_vendor(int M, int N, int K, const double* dA, const double* dB,
-               double* dC, int splits, cublasHandle_t handle,
-               cudaStream_t stream) {
-    int result = reserve_vendor_workspace();
-    if (result != 0) return result;
-
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
-    CUBLAS_CHECK(cublasSetWorkspace(handle, workspace.vendor,
-                                    kVendorWorkspaceBytes));
-    CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST));
-    CUBLAS_CHECK(cublasSetMathMode(
-        handle, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
-    CUBLAS_CHECK(cublasSetEmulationStrategy(
-        handle, CUBLAS_EMULATION_STRATEGY_EAGER));
-    CUBLAS_CHECK(cublasSetFixedPointEmulationMantissaControl(
-        handle, CUDA_EMULATION_MANTISSA_CONTROL_FIXED));
-    int max_mantissa_bits = 8 * splits;
-    if (max_mantissa_bits > 55) max_mantissa_bits = 55;
-    CUBLAS_CHECK(cublasSetFixedPointEmulationMaxMantissaBitCount(
-        handle, max_mantissa_bits));
-
-    const double alpha = 1.0;
-    const double beta = 0.0;
-    CUBLAS_CHECK(cublasGemmEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha,
-        dA, CUDA_R_64F, M, dB, CUDA_R_64F, K, &beta, dC, CUDA_R_64F, M,
-        CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT, CUBLAS_GEMM_DEFAULT));
     return 0;
 }
 
@@ -410,13 +451,6 @@ extern "C" int gemm_my_int8_fp64(
     if (result != 0) return result;
     result = begin_workspace_use(stream);
     if (result != 0) return result;
-
-    // lab3 is Hopper; retain the independently measured Ampere fallback for
-    // compatibility with lab4g10 and other CC 8.x devices.
-    if (workspace.compute_major >= 9) {
-        result = run_vendor(M, N, K, dA, dB, dC, splits, handle, stream);
-        return finish_workspace_use(stream, result);
-    }
 
     switch (splits) {
         case 1: result = run_manual<1>(M, N, K, dA, dB, dC, handle, stream); break;
