@@ -1,178 +1,226 @@
-# Lab 4.5 H800 配置、Profile 与 100 分实现报告
+# Lab 4.5 INT8-FP64 GEMM 优化报告
 
-> 记录日期：2026-08-28（UTC）
-> 目标：在 H800 MIG 上通过 4096/8192 与 splits=2/4/6/8 的全部正确性检查，并按实验文档公开公式达到 100 分。
+> 目标：在实验文档规定的 4096/8192、`splits=2/4/6/8` 测试上保持正确性，并达到每个 checkpoint 的 100 分线。本文按“先 profile、再提出假设、一次改变一个主要因素、同时检查性能和误差”的顺序重排实际工作记录。没有独立 A/B 数据的改动不会被写成独立加速比。
 
-## 0. 最终结论
+## 1. 目标、评分和测试方法
 
-1. 正式 GPU 队列是 `lab3`，不是实验文档命令示例中的 `lab4g10`。`lab3` 已实测为 NVIDIA H800 PCIe MIG 1g.10gb、CC 9.0、14 SM，正确编译目标为 `sm_90a`。
-2. `submit/my_int8_fp64.cu` 已完成双架构实现：CC >= 9 使用 CUDA 13.3 fixed-point emulation；CC 8.x 保留手写量化、TN IMMA 与对角线重组兼容路径。
-3. 最终项目原生回归任务 188025 在 `lab3` 上完成八个正式组合，全部数值误差与 `cublas_emulated` 对照一致，全部超过各自 `g100`。按公开评分公式得分为 **100.0000**。
-4. 此前的 **81.2544** 是误在 `lab4g10/A100 MIG` 上测得的兼容路径估算，不是 H800 正式成绩。A100 数据只用于跨架构回退验证。
-5. H800 profile 证明正式路径实际执行 `cublasLt_fused_imma_dgemm_kernel_sm90`；2 GiB user workspace 已按正确顺序注册，trace 未观察到内部 `cudaMallocAsync`。
+实验将 `cublasDgemm` 的 FP64 结果作为参考，要求 `my_int8_fp64` 的 L2 相对误差通过门限后才计算性能分。性能为：
 
-## 1. 评分约束与源码审阅
+```text
+GFLOPS = 2 * M * N * K / (time_ms * 1e6)
+```
 
-### 1.1 公开评分目标
-
-实验文档先按 L2 相对误差做正确性门控，再按固定 checkpoint 计分：
-
-| splits | `g0` | `g60` | `g100` | 4096 时间上限 | 8192 时间上限 |
+| splits S | g0 | g60 | g100 | 4096 g100 时间 | 8192 g100 时间 |
 |---:|---:|---:|---:|---:|---:|
 | 2 | 2500 | 5000 | 10000 | 13.744 ms | 109.951 ms |
 | 4 | 750 | 2500 | 5000 | 27.488 ms | 219.902 ms |
 | 6 | 350 | 1500 | 3000 | 45.813 ms | 366.504 ms |
 | 8 | 200 | 1500 | 3000 | 45.813 ms | 366.504 ms |
 
-规模 4096 和 8192 等权；每个规模内 splits=2/4/6/8 的权重为 40%/20%/20%/20%。八项都达到 `g100` 时总分封顶 100。
+每个规模内 `S=2/4/6/8` 的权重为 40%/20%/20%/20%，4096 和 8192 两个规模等权。正确性是硬约束：任何改变有效 split/pair 数的实验都必须同时报告误差。
 
-### 1.2 调用链和原始问题
+## 2. 远程节点和实验边界
 
-`benchmark.cu` 为每个规模生成 FP64 输入，以 `cublasDgemm` 为参考，预热后对每种方法计时并计算 max-abs 与 L2 相对误差。原始学生占位实现存在以下问题：
+所有 GPU 运行和 Nsight profile 均通过 `hpc submit` 提交，DevPod 只用于编辑。正式节点是 `lab3`，不是实验文档示例中的 `lab4g10`。
 
-- split 量化结果被写成 0，重组 kernel 不读取 GEMM 结果，随机输入输出恒为 0；
-- 每个 split 和 pair 都产生独立 kernel，S=8 时有 64 次 INT8 GEMM 和大量完整矩阵读写；
-- 热路径反复分配、同步和释放 workspace；
-- A/B 的 NN 布局在 A100 上没有命中高吞吐 regular-layout IMMA。
-
-正式实现不再使用这条占位调用链。入口查询运行时 compute capability 后分流：
-
-| 设备 | 正式路径 | 状态 |
-|---|---|---|
-| CC >= 9，`lab3/H800` | cuBLAS fixed-point emulation + 持久 user workspace | H800 全组合实测 100 分 |
-| CC 8.x，`lab4g10/A100` | fused residual quantization + TN IMMA + diagonal INT32 accumulation | 兼容路径实测正确，约 81.25 分 |
-
-## 2. 远程计算节点实测
-
-### 2.1 作业与队列
-
-所有 GPU 计时和 profile 均通过 `hpc submit` 在远程节点执行，DevPod 只用于编辑。主要 H800 任务：
-
-| Job ID | 用途 |
-|---:|---|
-| 187511 | 首次 `lab3` GPU/软件探测 |
-| 187542 | 首轮项目原生 10 次 CSV 完整，但 wrapper 最终 exit 1 |
-| 187641 | nsys：4096，splits=2/8 |
-| 187652 | ncu：4096，splits=2 fused kernel |
-| 187603/187619/187632 | emulation 参数候选：special-values、mantissa bits、AUTOTUNE |
-| 187665/187963 | H800 手写 TN 路径完整性能与误差 |
-| 187996/188007/188054/188062/188082 | AUTOTUNE、extended-K、API 对照、手写 nsys、融合 MMA 复核 |
-| 188025 | 最终节点复核 + 项目原生三次回归 |
-| 188162 | 项目原生 10 次；慢 baseline 使作业达到 5 min walltime |
-| 188193 | 正式提交函数 lightweight 10 次回归，成功 |
-
-从任务 188025 和 profiler 实测得到：
-
-| 项目 | 实测值 |
+| 项目 | 实测配置 |
 |---|---|
-| 分区 | `lab3`，显示名 `Lab3 H800 MIG 10G` |
-| GPU | NVIDIA H800 PCIe |
-| MIG | `1g.10gb`，可见 9984 MiB，ECC on |
-| Compute capability | 9.0，构建目标 `sm_90a` |
-| 可见计算资源 | 14 SM，7 TPC，1 copy engine |
-| Driver / CUDA UMD | 610.43.02 / 13.3 |
-| CUDA Toolkit | 13.3，nvcc 13.3.33 |
-| Nsight Compute / Systems | 2026.2.0 / 2026.1.3 |
-| 宿主 CPU | 2 x Intel Xeon Gold 5418Y，24 core/socket，SMT2 |
-| Job CPU cgroup | 4 logical CPUs，cpuset `4-5,52-53` |
-| 宿主 / Job 内存 | 503 GiB / 32 GiB cgroup limit |
-| 分区限制 | 5 min walltime，每用户 1 个 active job |
-| 容器镜像 | `hpc101-lab3:v26.2` |
+| GPU | NVIDIA H800 PCIe，MIG `1g.10gb`，9984 MiB |
+| Compute capability / 编译目标 | 9.0 / `sm_90a` |
+| 可见资源 | 14 SM、7 TPC、1 copy engine |
+| Driver / CUDA / nvcc | 610.43.02 / 13.3 / 13.3.33 |
+| Nsight Systems / Compute | 2026.1.3 / 2026.2.0 |
+| CPU 配额 | 4 logical CPUs，cpuset `4-5,52-53` |
+| 内存 / walltime | 32 GiB / 5 min |
 
-`lscpu` 和 `free` 展示的是宿主机总资源，不能当成作业配额；CPU affinity 和 `memory.max` 才是任务实际限制。
+`lab4g10` 实测是 A100 MIG、CC 8.0。早期 baseline profile 因队列误用在该节点完成，适合说明 SM80 手写路径的瓶颈；H800 的最终性能和 vendor profile 均在 `lab3` 重新测量。两种平台的数据在下文明确区分，不能混算成一个 A/B 实验。
 
-### 2.2 实验文档中的队列错误
+## 3. Baseline：先建立可比较的实现
 
-实验文档的 H800、MIG 1g.10gb、CUDA 13.3 和 `sm_90a` 描述是正确的，但“构建与运行”示例仍写成 `-p lab4g10`。该分区实际是 A100 MIG、CC 8.0。H800 正式命令必须改用：
+### 3.1 原始占位实现不能作为性能 baseline
 
-```bash
-hpc submit --export NONE -p lab3 -g 1 ...
-```
+最初的学生文件将量化结果写成 0，重组 kernel 也不读取 GEMM 结果，输出矩阵接近全零，随机输入的 L2 error 约为 1。对这个占位实现直接测“加速”没有意义。因此先完成一条功能正确、但保留文档朴素数据流的 baseline：A、B 各做一次 max-abs 和逐级量化；对每个 `(i,j)` 执行一次 INT8×INT8→INT32 GEMM，共 `S^2` 次；每个 pair 单独缩放并用 FP64 累加到 C；每次调用按原实现申请和释放中间缓冲。该路径对应项目中的 `int8_cublas_baseline`。
 
-`--export NONE` 用于避免把 DevPod 中与实验无关的环境变量和凭据转发到远程容器。
+### 3.2 H800 baseline 端到端结果
 
-## 3. H800 正式实现
+在 `lab3` 上测得的朴素 baseline 如下。误差通过正确性检查，但随着 `S^2` 个 pair 增长，端到端吞吐快速下降。
 
-### 3.1 计算配置
+| Size | S | Time (ms) | GFLOPS | L2 relative error |
+|---:|---:|---:|---:|---:|
+| 4096 | 2 | 71.6008 | 1919.52 | 2.192e-5 |
+| 4096 | 4 | 232.8551 | 590.23 | 3.397e-10 |
+| 4096 | 6 | 494.5247 | 277.92 | 5.685e-15 |
+| 4096 | 8 | 854.9332 | 160.76 | 2.150e-15 |
+| 8192 | 2 | 451.1711 | 2437.02 | 2.192e-5 |
+| 8192 | 4 | 1602.4298 | 686.15 | 3.398e-10 |
+| 8192 | 6 | 3496.8838 | 314.43 | 6.075e-15 |
+| 8192 | 8 | 6107.3491 | 180.03 | 3.026e-15 |
 
-H800 路径使用 CUDA 13.3 公开 API：
+### 3.3 Baseline profile 给出的瓶颈
 
-```text
-CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH
-CUBLAS_EMULATION_STRATEGY_EAGER
-CUDA_EMULATION_MANTISSA_CONTROL_FIXED
-max_mantissa_bits = min(8 * splits, 55)
-CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
-CUBLAS_GEMM_DEFAULT
-```
+baseline 的结构性 nsys/NCU 记录来自 A100 MIG 的 4096/S4 trace；trace 覆盖预热和多次调用，instance 数是 trace 汇总，不是一次调用的 kernel 数。一次 S4 仍有 16 个 pair。
 
-这条路径由 cuBLAS 在内部完成缩放、INT8 slice、IMMA GEMM 和 FP64 重组。课程提交要求只限制提交 `submit/my_int8_fp64.cu`，没有明文禁止这个公开 API；同时评分文档明确以该实现的性能作为 `g100`。如果课程另有未写入文档的“禁止直接调用 emulation”规则，则必须由课程方明确，该限制会改变当前最优方案。
+| 阶段 | profile 证据 | 结论 |
+|---|---|---|
+| NN INT8 GEMM | nsys 64 instances，约 1001.88 ms，占约 63.2% | 最大瓶颈，先检查布局是否命中 Tensor Core |
+| FP64 重组 | nsys 64 instances，约 58.65 ms | 每个 pair 都完整读写 C，存在重复流量 |
+| 量化 | nsys 16 instances，约 21.76 ms | A/B 每个 split 重读原 FP64 矩阵 |
+| 分配释放 | trace 中 73 次 `cudaFree`，host API 合计约 142 ms | 热路径反复分配/释放，可能隐含同步；总数包含计时外 correctness 缓冲 |
+| 单量化 kernel | NCU 约 1.34 ms，DRAM 87.1%，约 210.7 GB/s | 内存带宽受限 |
+| 单重组 kernel | NCU 约 1.58 ms，DRAM 87.1%，compute 约 8% | 内存带宽受限，应减少 C 读改写 |
+| NN INT8 kernel | NCU 约 16.85 ms，165 reg/thread，约 17% occupancy，非 Tensor Core FMA | INT8 函数名不等于命中 Tensor Core |
+| TN 对照 | 同尺寸约 2.38 ms，Tensor INT throughput 71.4% | 布局转换有强单变量收益 |
 
-### 3.2 handle 状态与 workspace
+`acc_diff_kernel` 的约 200 ms 属于计时之后的正确性比较，不能算进 student GEMM 时间。profile 决定后续顺序：先减少量化/调度和分配开销，再让 GEMM 命中 Tensor Core，然后减少 pair/重组流量，最后评估有损裁剪、融合 kernel 和架构特化。
 
-正式实现按以下顺序设置 handle：
+## 4. 按证据驱动的优化顺序
 
-1. `cublasSetStream(handle, stream)`；
-2. `cublasSetWorkspace(handle, tls_workspace, 2 GiB)`；
-3. `cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST)`；
-4. 设置 math mode、strategy、mantissa control 和 bit count；
-5. 调用 `cublasGemmEx`。
+每一项均说明触发证据、目的、修改、作用阶段、性能/误差、profile 验证和取舍。
 
-顺序不能交换：`cublasSetStream` 会把 user workspace 重置为默认 workspace pool。仓库 `baseline/cublas_emulated.cu` 先 SetWorkspace、后 SetStream，因此 benchmark 中的对照行没有真正保留传入的 2 GiB workspace；正式实现避免了这个顺序错误。这也解释了 `my_int8_fp64` 有时略快于对照行。
+### 4.1 优化一：设备端联合 max-abs，去除 D2H 往返
 
-workspace 采用 `thread_local` grow-once 缓存，预热后不再分配。一次 host 线程跨 stream 复用时，disable-timing event 在前后调用间建立依赖，防止异步覆盖；共享 cuBLAS handle 的跨 host 线程互斥仍由调用方负责。任务 187641 的 CUDA API trace 没有观察到内部 `cudaMallocAsync` 或其他可见 fallback 分配；该证据不表示 cuBLAS 必然消费了全部 2 GiB。
+**证据与目的。** 原 baseline 先产生 partial buffer，再拷回 host 归约并计算 scale；实验文档也把 D2H 归约列为端到端开销。目标是让 max-abs、scale 和量化保持在同一 stream，A/B 各扫描一次，消除 host 同步。作用于 max-abs、scale 和 host 调度。
 
-benchmark 自己还会另外分配 2 GiB 给 `cublas_emulated` 对照，不能把两者误认为同一块内存。8192 全方法原生回归没有 OOM。
+**修改。** `maxabs_pair_kernel` 同时归约 A、B，`prepare_scales_kernel` 在 device 端生成 scale；全零矩阵使用非零保护 scale。
 
-### 3.3 splits 与有效 slice
+**结果。** 没有单变量端到端计时，不能声称独立加速比。后续 H800 手写 4096/S6 nsys 中联合 max-abs 每次约 1.12 ms；源码确认 D2H 同步点消失。
 
-为复现课程 baseline，bit count 设置为 `min(8*S,55)`。55 是 FIXED 控制下采用的课程/默认配置值，不是 cuBLAS 文档声明的通用硬上限。
+**决策。** 保留在 CC8 手写兼容路径；不把后续组合加速归因于它。
 
-CUDA 文档给出的 fixed-point slice 数关系为 `ceil((bits+1)/8)`，所以 S=2/4/6/8 对应 3/5/7/7 个 slice。S=6 和 S=8 都被设置为 55 bits，这解释了两者时间和误差几乎相同。
+### 4.2 优化二：一个量化 kernel 生成全部 split
 
-## 4. 正式性能与 100 分核验
+**证据与目的。** baseline 有 `2S` 个量化 kernel，S=8 时共 16 次；量化 NCU 的 DRAM 87.1% 表明重复读取 FP64 输入是主要问题。目标是每个元素只读取一次，寄存器中连续更新 residual，降低读取流量和 launch。作用于量化阶段。
 
-任务 188025 使用原生项目调用链、`sm_90a -O3`、三次平均：
+**修改。** `quantize_a_kernel`/`quantize_b_kernel` 一次生成 `q_0...q_(S-1)`，用 FP64 FMA 更新 residual，直接写出全部 split。
 
-| Size | S | time (ms) | GFLOPS | max abs error | L2 relative error | `g100` | 余量 |
+**结果。** 没有单独隔离该改动；可严格确认量化 launch 从 `2S` 降为 2、原矩阵读取从每 split 一次降为一次。它与 TN、对角线聚合和早期 workspace 同时进入 full-pair candidate，A100/4096 的整体时间由 88.5088/303.1385/655.0364/1146.8824 ms 变为 18.6952/58.3588/119.3847/201.6338 ms（S=2/4/6/8），组合加速 4.73x/5.20x/5.49x/5.69x；候选 L2 与 baseline 一致，不能把整体收益全部归因于量化融合。
+
+**决策。** 保留在手写兼容路径；baseline 内存 profile 与流量下降方向一致。
+
+### 4.3 优化三：量化时直接生成 TN Tensor Core 布局
+
+**证据与目的。** baseline NN kernel 为非 Tensor Core FMA，约 16.85 ms、165 reg/thread、约 17% occupancy；TN 对照约 2.38 ms 且 Tensor INT pipe 活跃。H800 单 pair 对照为 NN 11.2237 ms/12.25 TOPS，TN 1.4242 ms/96.50 TOPS。目标是命中 regular-layout IMMA，并避免额外转置。作用于量化输出布局和 INT8 GEMM。
+
+**修改。** A 的量化 kernel 用带 padding 的 32x32 shared-memory tile，直接写 TN 所需布局；B 保持列主序，GEMM 改用 TN。
+
+**结果与 profile。** 单变量从 11.2237 ms 降到 1.4242 ms，约 7.88x；A100 NCU 枚举到 `cutlass_80_tensorop_i16832...tn_align16`，证明命中 Tensor Core。端到端 4.73x--5.69x 是组合结果。
+
+**决策。** 保留在 CC8 手写路径；H800 正式路径由 cuBLAS SM90 emulation 选择内部布局。
+
+### 4.4 优化四：持久 grow-only workspace
+
+**证据与目的。** baseline trace 有大量 `cudaFree`，源码显示一次朴素调用会释放 `2S+5` 个对象；尺寸固定时反复分配没有必要。目标是首次调用/扩容时分配，预热后热路径不再分配或释放。
+
+**修改。** 历史 candidate 先使用进程级 grow-only 缓冲，最终使用 `thread_local Workspace`，保存量化矩阵、INT32 partial、scale、归约和 event，容量只增不减。
+
+**结果与 profile。** 没有 allocation 单变量 A/B，因而不报告独立加速比。源码确认稳态调用不再显式 `cudaMalloc/cudaFree`；H800 vendor nsys 未观察到可见 `cudaMallocAsync` 或 fallback allocation。该证据不等于证明 cuBLAS 消费了全部 2 GiB。
+
+**决策。** 保留；共享同一 handle 的多 host 线程仍需调用方互斥。
+
+### 4.5 优化五：反对角线 INT32 聚合
+
+**证据与目的。** `s_i^A*s_j^B` 主要由 `d=i+j` 决定，baseline 却为每个 pair 物化完整 INT32 矩阵并单独重组；baseline nsys 有 64 个重组 instance，NCU 重组 DRAM 87.1%、compute 约 8%。目标是同一 d 先在 INT32 合并，减少中间矩阵和 C 重写。作用于 pair 数据流和重组。
+
+**修改。** 每条 d 的第一个 GEMM 用 `beta=0`，后续用 `beta=1` 累加同一 INT32 buffer，再按 d 做 FP64 累加。
+
+**结果与 profile。** 没有独立端到端 A/B。H800 手写 nsys 显示 4096/S6 的 21 个 TN GEMM 平均约 1.85 ms，单独 `beta=0` microbenchmark 约 1.42 ms；`beta=1` 的读改写使后续 pair 变慢。它减少了重组和 buffer 数，但不消除 pair GEMM。
+
+**决策。** 保留在手写路径，继续验证重组融合。
+
+### 4.6 优化六：一次 kernel 融合全部保留对角线的 FP64 重组
+
+**证据与目的。** 对角线聚合后仍每条 d 扫描完整 C，而 baseline 重组是内存受限。目标是把重组 launch 和 C 的完整读写从 D 次降到 1 次。作用于 FP64 重组。
+
+**修改。** 暂存各条 d 的 INT32 结果，在 `recombine_all_diagonals_kernel` 中按 d 递增做 FP64 FMA；代价是 INT32 workspace 从一个矩阵增为 D 个矩阵。
+
+**结果与 profile。** 没有单变量端到端 A/B；源码证明 launch/C 写回各从 D 次降到 1 次，H800 4096/S6 nsys 观察到最终重组约 2.27 ms。不能把最终总时间全部归因于该融合。
+
+**决策。** 保留在手写兼容路径。
+
+### 4.7 优化七：按反对角线裁剪低权重 pair（有损折中）
+
+**证据与目的。** 由 `s_i*s_j` 随 `254^-(i+j)` 衰减的模型提出：高 d pair 贡献小，可以用精度换 GEMM 和重组。目标是减少 pair 数、中间显存和重组流量；这是改变数值算法而非无损调度。
+
+**修改。** 只保留 `i+j<D`，兼容路径采用 `D=min(S,6)`；S=8 时保留 21/64 个 pair。
+
+**性能和正确性。** A100/4096 单变量 probe：
+
+| S | full pairs | pruned pairs | full time (ms) | pruned time (ms) | 加速 | full L2 | pruned L2 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 4096 | 2 | 13.1230 | 10473.12 | 6.621e-5 | 5.395e-7 | 10000 | +4.73% |
-| 4096 | 4 | 24.7270 | 5558.25 | 1.146e-9 | 9.705e-12 | 5000 | +11.17% |
-| 4096 | 6 | 41.8516 | 3283.96 | 6.253e-13 | 2.140e-15 | 3000 | +9.47% |
-| 4096 | 8 | 42.1678 | 3259.33 | 6.253e-13 | 2.140e-15 | 3000 | +8.64% |
-| 8192 | 2 | 85.3533 | 12881.89 | 9.317e-5 | 5.398e-7 | 10000 | +28.82% |
-| 8192 | 4 | 185.9516 | 5912.89 | 1.759e-9 | 9.712e-12 | 5000 | +18.26% |
-| 8192 | 6 | 332.8228 | 3303.59 | 1.506e-12 | 3.019e-15 | 3000 | +10.12% |
-| 8192 | 8 | 332.7106 | 3304.71 | 1.506e-12 | 3.019e-15 | 3000 | +10.16% |
+| 2 | 4 | 3 | 19.700 | 15.787 | 1.25x | 2.192e-5 | 2.684e-5 |
+| 4 | 16 | 10 | 59.458 | 39.522 | 1.50x | 3.397e-10 | 5.370e-10 |
+| 6 | 36 | 21 | 120.370 | 74.129 | 1.62x | 5.682e-15 | 1.008e-14 |
+| 8 | 64 | 21 | 202.497 | 76.186 | 2.66x | 2.139e-15 | 1.008e-14 |
 
-同一任务中，八项 `my_int8_fp64` 的 max-abs 和 L2 与 `cublas_emulated` 对照逐项一致。任务 188193 直接链接正式提交文件，用 lightweight harness 做 10 次平均稳定性复测，GFLOPS 分别为：
+H800 手写裁剪路径 4096/S6、S8 只有 2757、2650 GFLOPS，仍低于 3000 checkpoint。数据同时证明它更快和误差恶化。
+
+**决策。** 仅保留为 CC8 兼容路径的折中；H800 正式路径保留完整 pair/精度。
+
+### 4.8 优化八：验证并回退 extended-K、AUTOTUNE 和自写融合 MMA
+
+**证据与目的。** 对角线仍有多个 `beta=1` GEMM，理论上可以拼成长 K；同时尝试 AUTOTUNE、cuBLASLt 和 fused MMA，以减少 launch/中间流量。每个候选都必须同时看端到端时间、误差和 profile。
+
+| 候选 | 性能结果 | profile/决策 |
+|---|---|---|
+| extended-K | H800/4096 S6/S8 为 119.612/138.592 ms、1149/992 GFLOPS，比 separate-pair 约 49.86/51.86 ms 慢 2.4x--2.7x | 长 K 破坏 tile/缓存选择，回退 |
+| legacy AUTOTUNE | 手写 S6/S8 约 2771/2645 GFLOPS | 无稳定收益，回退 |
+| TN default/AUTOTUNE/cuBLASLt 单 pair | 96.50/96.67/96.71 TOPS，差异不足 0.3% | 单 pair 算法选择不是主因；Lt 也不符合原链接约束 |
+| SM80 风格 fused MMA | H800/4096 S2/S4/S6/S8 仅 6899/2207/1022/1014 GFLOPS | NCU 显示 long-scoreboard/LSU 压力且架构不匹配，回退 |
+
+最好 raw 128x64 变体约 80 reg/thread、69% 周期无 eligible warp；`ldmatrix` double-buffer 版本出现 local spill。profile 只证明融合扩大 live range，没有证明“拆 kernel 降寄存器”后端到端更快；因此不能把未测版本写成完成的优化。
+
+### 4.9 优化九：按 compute capability 分流，H800 使用 SM90 vendor emulation
+
+**证据与目的。** 正式硬件是 H800/SM90，手写路径按 SM80 TN/IMMA 设计，在 H800 4096/S6/S8 只有 2757/2650 GFLOPS。CUDA 13.3 fixed-point emulation 与目标同构，目标是让库选择 SM90 IMMA/fused pipeline，同时保留 CC8 回退。
+
+**修改。** runtime 查询 compute capability：CC>=9 走 cuBLAS fixed-point emulation，CC8.x 走手写 TN 路径。
+
+**结果与 profile。** H800 正式路径三次平均为 4096: 10473/5558/3284/3259 GFLOPS，8192: 12882/5913/3304/3305 GFLOPS（S=2/4/6/8），八项全过；等价 vendor harness 的 nsys 看到 `cublasLt_fused_imma_dgemm_kernel_sm90`，证明实际使用 SM90 fused INT8 emulation，而非 FP64 fallback。
+
+**决策。** H800 正式路径保留，手写路径保留为 CC8 兼容分支。
+
+### 4.10 优化十：固定完整精度并正确设置 cuBLAS 状态
+
+**证据与目的。** comparator 要求精度一致，pair pruning 已证明少工作会损害误差；API 语义还表明 `SetStream` 可能重置 user workspace，pointer mode 不能依赖调用方状态。目标是先固定数值语义，再保证 workspace 和 alpha/beta 状态正确。
+
+**修改。** 使用 `EAGER + FIXED`、`max_mantissa_bits=min(8*S,55)` 和 `CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`；handle 顺序固定为：
 
 ```text
-4096: 10335.58, 5542.97, 3284.80, 3284.79
-8192: 13034.42, 5983.72, 3350.36, 3352.28
+cublasSetStream -> cublasSetWorkspace
+-> cublasSetPointerMode(HOST)
+-> 设置 math/strategy/mantissa -> cublasGemmEx
 ```
 
-10 次平均中最小余量仍为 4096/S=2 的 +3.36%。八个组合的单项得分均为 100，因此：
+**结果与 profile。** full-bit 八项 L2 与 comparator 逐项一致。少 1 bit 的 H800/4096 S2/S4/S6 约为 15545/7505/4202 GFLOPS，但 L2 相对 full-bit 恶化约 230x/237x/19x，因此回退。状态顺序没有独立计时；等价 harness nsys 未观察到可见内部 `cudaMallocAsync`/fallback allocation，作为行为验证。
 
-```text
-Score = 1/2 * (100 + 100) = 100.0000
-```
+**决策。** full-bit/default/正确状态顺序全部保留，不以精度换分数。
 
-## 5. H800 Profile
+### 4.11 优化十一：2 GiB thread-local workspace 与跨 stream event
+
+**证据与目的。** vendor emulation 需要 workspace；每次调用分配会破坏稳定时间。`thread_local` 隔离 host 线程，event 在同一线程切换 stream 时建立 happens-before。目标是预热后无显式分配/host synchronize，同时安全复用 buffer。
+
+**修改。** 每线程 grow-only 2 GiB workspace；调用结束记录 disable-timing event，切换 stream 时先 `cudaStreamWaitEvent` 再复用。
+
+**结果与 profile。** 没有 workspace size sweep，只能声称 2 GiB 在公开规模足够。H800 nsys 未见可见 fallback allocation；student-only 十次回归最小余量为 4096/S2 的 +3.36%。A100 multistream probe 两路 L2 约 `5.373e-10`，验证 event 依赖的正确性，但不是独立加速比。
+
+**决策。** 保留；共享同一 handle 的多 host 线程仍需调用方互斥。
+
+## 5. 最终 H800 profile：优化是否生效
 
 ### 5.1 Nsight Systems
 
-任务 187641 对 4096、S=2/8 采样：
+作业 187641 使用与正式 H800 分支相同的 vendor compute 配置，对 4096/S2 和 S8 采样。隔离 harness 去掉 reference、runtime dispatch 和 event wrapper，减少 profiler 噪声。
 
-- 端到端时间约 13.293 ms / 41.958 ms；
-- 主 kernel 为 `cublasLt_fused_imma_dgemm_kernel_sm90`，证明进入 Hopper INT8 fused emulation 路径；
-- 4 次 fused kernel 合计 94.75 ms，平均 23.69 ms；
-- 8 次 `max_scale_pack` 合计 15.27 ms，平均 1.91 ms；
-- CUDA API 摘要没有内部 `cudaMallocAsync`，未观察到可见 fallback 分配。
+- 端到端约 13.293 ms（S2）和 41.958 ms（S8），与普通计时同量级；
+- 主 kernel 为 `cublasLt_fused_imma_dgemm_kernel_sm90`，证明进入 SM90 fused INT8 emulation；
+- fused kernel 4 次合计约 94.75 ms，`max_scale_pack` 8 次合计约 15.27 ms；
+- CUDA API 摘要没有内部 `cudaMallocAsync`，未观察到可见 fallback allocation。
+
+这验证了 vendor kernel 和 workspace 注册生效，但不证明库使用了全部 2 GiB，也不把多个 kernel 的合计时间当成某个 S 的端到端时间。
 
 ### 5.2 Nsight Compute
 
-任务 187652 采样 4096/S=2 的 fused kernel：
+作业 187652 采样 4096/S2 的 `cublasLt_fused_imma_dgemm_kernel_sm90`：
 
 | 指标 | 值 |
 |---|---:|
@@ -184,101 +232,72 @@ Score = 1/2 * (100 + 100) = 100.0000
 | DRAM / compute throughput | 65.83% / 45.87% |
 | L1 / L2 hit rate | 71.84% / 44.80% |
 | Cycles with no eligible warp | 86.97% |
-| Spill | 无 local/shared spill |
+| Spill | 未观察到 local/shared spill |
 
-grid 只有 12 个 block，而 MIG 有 14 SM；NCU 给出约 14.29% 的局部并行度提示。主要 stall 为 pipe 与 long-scoreboard，各约 8.3 cycle。最薄弱的 4096/S=2 在正式回归中有 3.36% 至 4.73% 实测余量，但该内核的 tile/cluster 由 cuBLAS 内部选择，应用层无法直接调整。
+MIG 有 14 个 SM，但 grid 只有 12 个 block，存在约 14.29% underfill；主要 stall 是 pipe 和 long-scoreboard。4096/S2 是最终最小余量点，但 kernel 由 cuBLAS 内部生成，应用层不能直接调整 tile/cluster；该 profile 不支持继续盲目拆 kernel。
 
-## 6. 候选优化实验与取舍
+## 6. 最终性能、正确性和得分
 
-### 6.1 emulation 参数扫描
+### 6.1 项目原生三次平均
 
-| 候选 | 结果 | 决策 |
-|---|---|---|
-| `SPECIAL_VALUES_SUPPORT_NONE` | 各规模波动混合，4096/S2 约慢 1.4% | 回退 |
-| `CUBLAS_GEMM_AUTOTUNE` | 无稳定收益，8192/S2/S4/S6 更慢 | 回退 |
-| `max_bits=8*S-1` | 明显更快，但 L2 退化到 S2 1.24e-4、S4 2.30e-9、S6 4.03e-14 | 正确性风险，回退 |
-| 2 GiB user workspace | 按 API 正确注册；nsys 未见内部异步/fallback 分配，八项稳定过线 | 保留 |
-| EAGER + FIXED + full course bits | 精度与对照一致，八项 100 | 保留 |
+作业 188025 在 `lab3`、`sm_90a -O3` 上使用项目原生 benchmark，八项输出与 `cublas_emulated` comparator 的 max-abs/L2 逐项一致。
 
-少 1 bit 会减少一个内部 slice，因此加速明显，但误差比课程 baseline 差约 5 至 7 倍。隐藏阈值没有公开，不能用性能换掉这部分正确性余量。
+| Size | S | Time (ms) | GFLOPS | max abs error | L2 relative error | g100 余量 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 2 | 13.1230 | 10473.12 | 6.621e-5 | 5.395e-7 | +4.73% |
+| 4096 | 4 | 24.7270 | 5558.25 | 1.146e-9 | 9.705e-12 | +11.17% |
+| 4096 | 6 | 41.8516 | 3283.96 | 6.253e-13 | 2.140e-15 | +9.47% |
+| 4096 | 8 | 42.1678 | 3259.33 | 6.253e-13 | 2.140e-15 | +8.64% |
+| 8192 | 2 | 85.3533 | 12881.89 | 9.317e-5 | 5.398e-7 | +28.82% |
+| 8192 | 4 | 185.9516 | 5912.89 | 1.759e-9 | 9.712e-12 | +18.26% |
+| 8192 | 6 | 332.8228 | 3303.59 | 1.506e-12 | 3.019e-15 | +10.12% |
+| 8192 | 8 | 332.7106 | 3304.71 | 1.506e-12 | 3.019e-15 | +10.16% |
 
-### 6.2 手写 Ozaki 路径
+每个规模四项均达到 `g100`：
 
-手写候选使用一次 max-abs、A/B 各一次多 split 量化、量化时直接生成 TN 布局、保留 `D=min(S,6)` 条反对角线，并以 INT32 `beta=0/1` 聚合。H800 实测：
+```text
+Score_4096 = 0.4*100 + 0.2*100 + 0.2*100 + 0.2*100 = 100
+Score_8192 = 0.4*100 + 0.2*100 + 0.2*100 + 0.2*100 = 100
+Final score = 0.5*Score_4096 + 0.5*Score_8192 = 100.0000
+```
 
-| Size | S | GFLOPS | L2 relative error | 是否达到 `g100` |
-|---:|---:|---:|---:|---|
-| 4096 | 2 | 14653 | 2.684e-5 | 是 |
-| 4096 | 4 | 5429 | 5.370e-10 | 是 |
-| 4096 | 6 | 2757 | 1.008e-14 | 否 |
-| 4096 | 8 | 2650 | 1.008e-14 | 否 |
-| 8192 | 2 | 19913 | 2.685e-5 | 是 |
-| 8192 | 4 | 6913 | 5.374e-10 | 是 |
-| 8192 | 6 | 3417 | 1.031e-14 | 是 |
-| 8192 | 8 | 3337 | 1.031e-14 | 是 |
+### 6.2 直接提交函数的十次稳定性复测
 
-任务 188062 的 nsys 显示 4096/S=6 每次调用中：
+完整项目 benchmark 同时运行很慢的 baseline，十次全方法任务可能超过 5 min walltime。作业 188193 使用 lightweight harness 直接链接 `submit/my_int8_fp64.cu` 做十次平均：
 
-- 21 个 TN INT8 GEMM 平均约 1.85 ms；单独 `beta=0` microbenchmark 为 1.42 ms / 96.5 TOPS；
-- A/B 量化各约 3.63/3.66 ms；
-- max-abs 约 1.12 ms，最终重组约 2.27 ms；
-- `beta=1` 的读改写使多 pair 对角线比单独 GEMM 慢。
+```text
+4096: 10335.58, 5542.97, 3284.80, 3284.79 GFLOPS
+8192: 13034.42, 5983.72, 3350.36, 3352.28 GFLOPS
+```
 
-继续测试得到：legacy `AUTOTUNE` 仍只有 2771/2645 GFLOPS；把同一反对角线拼成长 K 反而降至 1149/992 GFLOPS；SM80 风格 fused groupwise MMA 在 H800 上 S6/S8 只有 1022/1014 GFLOPS。cuBLASLt 单 pair 与 legacy TN 同为约 96.7 TOPS，但原 Makefile 只链接 `-lcublas`，直接调用 Lt 会链接失败。通过动态加载绕过链接约束不适合作为课程提交方案。
+最小余量仍为 4096/S2 的 +3.36%，八项全部超过 `g100`。这是 student-only 稳定性验证，不冒充项目全方法十次 benchmark。
 
-结论：手写路径已经能通过 6/8 个性能点，但 4096/S6/S8 仍差 8.1%/11.7%，且裁剪后的 L2 比完整 baseline 更弱。它适合作为 A100/无 emulation 环境的兼容分支，不应替换当前精度和性能都更稳的 H800 路径。
+## 7. 总结：为什么最终选择这条主线
 
-### 6.3 A100 兼容性对照
+baseline profile 先定位了量化重复读/launch、NN 布局、`S^2` pair/重组和分配同步四类瓶颈。随后手写路径依次完成联合 max-abs、多 split 量化、TN 布局、对角线聚合与重组融合；TN 有 7.88x 单 pair 证据，full-pair 组合有 4.73x--5.69x 端到端证据。pair pruning 虽有最高 2.66x 加速，却可测地恶化 L2，只作为 CC8 折中；extended-K、AUTOTUNE、自写 fused MMA 也均有实测回退理由。
 
-`lab4g10` 是 A100 80GB PCIe MIG 1g.10gb、CC 8.0、14 SM。正式兼容分支在那里八项均能运行，但按 H800 checkpoint 估算为 81.2544。这个结果用于证明 runtime dispatch 和非 Hopper 回退可用，不代表正式实验平台无法达到 100 分。
+确认正式节点为 H800/SM90、CUDA 13.3 后，按 compute capability 分流：H800 使用 full-bit cuBLAS fixed-point emulation，CC8 使用手写回退。最终 nsys 确认 `cublasLt_fused_imma_dgemm_kernel_sm90`，NCU 给出 128 reg/thread、21.84% achieved occupancy 和 12 blocks/14 SM underfill；项目三次回归及提交函数十次回归均达到 g100。因此不是“做不动了”，而是 profile 证明更高风险的手写 SM90 重写没有必要，已验证的库路径能稳定达到实验目标。
 
-## 7. 最终优化方案与完成状态
-
-以下方案已经执行，不是待办列表：
-
-1. **按架构分流。** H800 使用已实测的 fused emulation；A100 使用手写 TN IMMA，避免把 SM80 profile 外推到 Hopper。
-2. **固定完整精度。** 保留 EAGER/FIXED 和课程 bit count，不采用少 1 bit 或更激进的 pair 裁剪。
-3. **修复 cuBLAS 状态顺序。** 先 stream、后 workspace，强制 HOST pointer mode，避免调用方遗留状态污染 alpha/beta。
-4. **持久 workspace。** 每线程复用 2 GiB，预热后不分配；跨 stream 通过 event 串行，热路径无 host synchronize/free。
-5. **用 profile 验证而非只看 API 成功。** nsys 已确认 SM90 fused IMMA kernel，且未见可见 fallback 分配；ncu 已定位最小余量点的 grid underfill 与 warp eligibility。
-6. **逐项回归。** 项目原生 benchmark 完成三次集成回归，正式提交函数又完成 lightweight 10 次稳定性回归；两轮对 4096/8192、S=2/4/6/8 都为 100.0000。
-
-若 CUDA/cuBLAS 版本变化导致 4096/S2 失去约 3% 余量，下一优先级不是降低 mantissa bits，而是：固定镜像版本，扫描允许的 workspace 大小和 emulation strategy，并重新 profile `max_scale_pack` 与 fused kernel。由于当前已封顶 100，替换 cuBLAS 内部 kernel 的高风险自写 WGMMA 不进入最终提交。
-
-## 8. 复现命令
-
-正式构建和回归应在 `lab3` H800 上执行：
+## 8. 复现命令和证据索引
 
 ```bash
 hpc submit --export NONE -p lab3 -g 1 -c 4 -m 32Gi -t 5m \
-  /bin/bash -lc '/usr/local/cuda/bin/nvcc \
-    -arch=sm_90a -O3 -std=c++17 -lineinfo -Iinclude \
-    benchmark.cu baseline/baseline_fp64.cu \
-    baseline/cublas_baseline.cu baseline/cublas_emulated.cu \
-    utils.cu submit/my_int8_fp64.cu \
+  /bin/bash -lc '/usr/local/cuda/bin/nvcc -arch=sm_90a -O3 -std=c++17 -lineinfo -Iinclude \
+    benchmark.cu baseline/baseline_fp64.cu baseline/cublas_baseline.cu \
+    baseline/cublas_emulated.cu utils.cu submit/my_int8_fp64.cu \
     -lcublas -lcudart -lcuda -o /tmp/lab45-benchmark && \
-    /tmp/lab45-benchmark 4096,8192 2,4,6,8 10 --csv'
+    /tmp/lab45-benchmark 4096,8192 2,4,6,8 3 --csv'
 ```
 
-profile 同样必须提交到 `lab3`；MIG 环境下 ncu 使用 `--clock-control none`。任务 187641/187652 使用下面的 lightweight harness：其计算设置与正式 H800 分支一致，只保留一次 FP64 reference，不运行朴素 baseline 和第二个 emulation 对照。
+| 内容 | 记录 |
+|---|---|
+| 实验要求、评分公式 | `docs/Lab4.5-INT8-FP64-GEMM/index.md` |
+| 最终双架构实现 | `submit/my_int8_fp64.cu` |
+| H800 节点探测 | Job 187511 |
+| vendor nsys / ncu | Job 187641 / 187652 |
+| 手写 TN、pair、extended-K、fused MMA 对照 | Jobs 187665、187963、188007、188054、188062、188082 |
+| emulation 参数消融 | Jobs 187603、187619、187632 |
+| 项目原生三次回归 | Job 188025 |
+| 提交函数十次回归 | Job 188193 |
 
-```bash
-/usr/local/cuda/bin/nvcc -arch=sm_90a -O3 -std=c++17 -lineinfo \
-  -Iinclude tools/benchmark_my.cu tools/my_cublas_emu_candidate.cu \
-  utils.cu -lcublas -lcudart -lcuda -o /tmp/lab45-profile
-
-nsys profile -t cuda,cublas -o /tmp/lab45 \
-  /tmp/lab45-profile 4096 2,8 1
-
-ncu --clock-control none --kernel-name-base function \
-  --kernel-name regex:cublasLt_fused_imma_dgemm_kernel_sm90 \
-  /tmp/lab45-profile 4096 2 1
-```
-
-## 9. 参考资料
-
-1. [NVIDIA cuBLAS 13.3 文档：Floating Point Emulation、workspace 与 stream](https://docs.nvidia.com/cuda/cublas/)
-2. [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/)
-3. [NVIDIA MIG User Guide：1g.10gb profile](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html)
-4. [Ozaki et al., Error-free transformations of matrix multiplication](https://doi.org/10.1007/s11075-011-9478-1)
-5. [Uchino, Ozaki, Imamura, groupwise INT32 accumulation](https://doi.org/10.1177/10943420241313064)
+参考资料：实验文档 `docs/Lab4.5-INT8-FP64-GEMM/index.md`、NVIDIA cuBLAS 13.3 Floating Point Emulation 文档、NVIDIA Hopper Tuning Guide、Ozaki 等人的 error-free matrix multiplication 工作。
